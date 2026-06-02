@@ -10,26 +10,23 @@ import de.lasse.lasseclient.config.LasseConfig.Notifications.SpawnNotification a
 import net.fabricmc.api.EnvType
 import net.fabricmc.api.Environment
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents
 import net.minecraft.client.MinecraftClient
 import net.minecraft.client.gui.DrawContext
 import net.minecraft.client.sound.PositionedSoundInstance
 import net.minecraft.sound.SoundEvents
 
 /**
- * Two ways to fire a HUD notification (+ a loud triple anvil ping):
- *
- *  1. **Chat messages** — any configured chat line flashes "Spawned!!!".
- *  2. **Mob names** — reuses the nametag-ESP detection ([NametagEspModule]); when a mob whose
- *     nametag matches a configured name spawns in, it flashes "RARE MOB SPAWNED IN" and the mob
- *     is highlighted via the inherited ESP (filled box + thick tracers, all changeable).
+ * Fires a HUD notification (+ a loud triple anvil ping) on **mob names** — reuses the nametag-ESP
+ * detection ([NametagEspModule]); when a mob whose nametag matches a configured name spawns in, it
+ * flashes "RARE MOB SPAWNED IN" and the mob is highlighted via the inherited ESP (filled box +
+ * thick tracers, all changeable).
  *
  * All settings come from [LasseConfig.Notifications.SpawnNotification].
  */
 @Environment(EnvType.CLIENT)
 class SpawnNotification : NametagEspModule(
     name = "Spawn Notification",
-    description = "Flashes a HUD notification + pings on configured chat lines or rare mob spawns.",
+    description = "Flashes a HUD notification + pings on rare mob spawns.",
     category = Category.NOTIFICATIONS,
 ) {
     override fun cfgMode(): HighlightMode = Cfg.mode
@@ -98,11 +95,6 @@ class SpawnNotification : NametagEspModule(
     init {
         HudManager.register(hud)
 
-        ClientReceiveMessageEvents.GAME.register(ClientReceiveMessageEvents.Game { message, overlay ->
-            if (!enabled || overlay) return@Game
-            if (containsAny(Notifications.spawnNotificationMessages, stripFormatting(message.string))) trigger(MESSAGE_LABEL)
-        })
-
         ClientTickEvents.END_CLIENT_TICK.register(ClientTickEvents.EndTick { mc ->
             if (soundsRemaining <= 0) return@EndTick
             if (soundCooldown > 0) {
@@ -139,7 +131,6 @@ class SpawnNotification : NametagEspModule(
     }
 
     private companion object {
-        const val MESSAGE_LABEL = "Spawned!!!"
         const val RARE_LABEL = "RARE MOB SPAWNED IN"
         const val PREVIEW_LABEL = "Spawned!!!"
         const val TEXT_SCALE = 3f

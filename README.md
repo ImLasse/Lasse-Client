@@ -29,8 +29,8 @@ it doesn't touch how you connect to the server.
 - **Chat Notifications** — Watches your chat and flashes a message on screen with a sound when
   something you care about shows up. You decide what to watch for, what it says, what color it is,
   and which sound plays.
-- **Spawn Notification** — Pops up an alert and plays a sound when a rare mob spawns or a chat line
-  you've set up appears, and highlights the spawn so you can see where it is.
+- **Spawn Notification** — Pops up an alert and plays a sound when a rare mob spawns, and
+  highlights the spawn so you can see where it is.
 
 ### Utilities
 

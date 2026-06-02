@@ -21,7 +21,6 @@ import net.minecraft.entity.EquipmentSlot
 import net.minecraft.entity.decoration.ArmorStandEntity
 import net.minecraft.util.math.BlockPos
 import net.minecraft.util.math.Box
-import net.minecraft.world.chunk.ChunkStatus
 import net.minecraft.util.math.MathHelper
 import net.minecraft.util.math.Vec3d
 import java.util.concurrent.ConcurrentHashMap
@@ -48,11 +47,21 @@ class MineshaftUtils : Module(
 ) {
     // ---- Corpse state ---------------------------------------------------------
 
-    /** Entity ids of corpses the player has opened (loot message seen); skipped while highlighting. */
-    private val openedCorpses: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    /** A cached corpse waypoint: its type and the (static) box to draw. Corpses don't move. */
+    private class CorpseWaypoint(val type: CorpseType, val box: Box)
 
-    /** Entity ids already announced to party chat, so each corpse is shared at most once. */
-    private val sharedCorpses: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    /**
+     * Corpses seen this mineshaft, keyed by block position. Once a corpse is detected its box is
+     * remembered here and keeps rendering even after the armor stand unloads (out of render
+     * distance) — it's only removed when opened or when leaving the mineshaft.
+     */
+    private val corpses: MutableMap<Long, CorpseWaypoint> = ConcurrentHashMap()
+
+    /** Block-position keys of corpses the player has opened; removed from the cache and never re-added. */
+    private val openedKeys: MutableSet<Long> = ConcurrentHashMap.newKeySet()
+
+    /** Block-position keys already announced to party chat, so each corpse is shared at most once. */
+    private val sharedKeys: MutableSet<Long> = ConcurrentHashMap.newKeySet()
 
     /** Server we last saw a corpse on — when it changes (warp to a new instance) we drop stale state. */
     @Volatile private var lastServerName: String? = null
@@ -62,15 +71,15 @@ class MineshaftUtils : Module(
 
     // ---- Fossil state ---------------------------------------------------------
     //
-    // Fossils are scanned exactly once per mineshaft instance: when you enter, we wait briefly for
-    // chunks to load, then sweep every loaded chunk around you a few chunks per tick (so there's no
-    // frame hitch), cluster the hits, and stop. We don't scan again until you enter another
-    // mineshaft (detected by the server name changing in [resetOnInstanceChange]).
+    // Fossils are scanned exactly once per mineshaft instance: a short delay after entering (so
+    // chunks load) we do one straightforward block sweep of the cube around us, cluster the hits,
+    // and stop. We don't scan again until you enter another mineshaft (server name changes). As you
+    // mine, the affected waypoints shrink/disappear without any re-scan.
 
     /**
      * A detected fossil: the quartz block positions that make it up plus their bounding box. We
      * keep the blocks (not just the box) so we can shrink/drop the waypoint as they're mined,
-     * without re-running the chunk scan.
+     * without re-running the scan.
      */
     private class Fossil(val blocks: MutableSet<Long>, @Volatile var box: Box)
 
@@ -80,20 +89,11 @@ class MineshaftUtils : Module(
     /** Server name we've already completed a scan for; `== current` means "don't scan again". */
     private var scannedServer: String? = null
 
-    /** True while a background scan is running, so we don't launch a second one. */
-    @Volatile private var scanning = false
-
-    /** Result handed back from the background scan thread; applied on the next client tick. */
-    @Volatile private var scanResult: ScanResult? = null
-
     /** Ticks to wait after entering before scanning, so nearby chunks have arrived. */
     private var entryDelay = 0
 
     /** Ticks until the next mined-block re-validation of existing fossils. */
     private var validateCooldown = 0
-
-    /** Background scan output, tagged with the instance it was for so a stale result is ignored. */
-    private class ScanResult(val server: String?, val fossils: List<Fossil>)
 
     init {
         WorldRenderEvents.END_MAIN.register(WorldRenderEvents.EndMain { ctx ->
@@ -106,7 +106,7 @@ class MineshaftUtils : Module(
                 return@EndTick
             }
             resetOnInstanceChange()
-            if (Cfg.corpseEnabled && Cfg.shareToParty) shareNewCorpses(mc)
+            if (Cfg.corpseEnabled) scanCorpses(mc)
             tickFossils(mc)
         })
 
@@ -123,21 +123,19 @@ class MineshaftUtils : Module(
     private fun isActive(): Boolean = enabled && HypixelLocation.onMineshaft
 
     /**
-     * Entity ids are per-server; warping to another mineshaft instance reuses them, so stale
-     * "opened"/"shared" ids could hide or skip a fresh corpse. Drop per-instance state when the
-     * server name changes.
+     * Corpse keys/positions are per-instance; warping to another mineshaft must not carry over old
+     * waypoints. Drop all per-instance corpse state (and re-arm the fossil scan) on a server change.
      */
     private fun resetOnInstanceChange() {
         val server = HypixelLocation.serverName
         if (server != lastServerName) {
             lastServerName = server
-            openedCorpses.clear()
-            sharedCorpses.clear()
+            corpses.clear()
+            openedKeys.clear()
+            sharedKeys.clear()
             // New mineshaft instance: forget old fossils and arm a fresh one-shot scan.
             fossils = emptyList()
             scannedServer = null
-            scanResult = null
-            scanning = false
             entryDelay = ENTRY_SCAN_DELAY_TICKS
         }
     }
@@ -154,31 +152,35 @@ class MineshaftUtils : Module(
     }
 
     /**
-     * Announce up to one newly-found corpse per cooldown to party chat via `/pc`. Only runs while
-     * another player shares the mineshaft (solo runs stay silent). Mirrors the highlight gating:
-     * only enabled types, in range, not already opened or shared.
+     * Detect loaded corpses within range and remember each one in [corpses] by block position, so
+     * its box persists after the armor stand unloads. Newly-seen corpses are also announced to party
+     * chat (at most one per cooldown) when [Cfg.shareToParty] is on and another real player shares
+     * the mineshaft. Corpses are cached regardless of their per-type toggle (render filters by it),
+     * so toggling a type back on reveals ones already discovered.
      */
-    private fun shareNewCorpses(mc: MinecraftClient) {
-        if (shareCooldown-- > 0) return
+    private fun scanCorpses(mc: MinecraftClient) {
         val world = mc.world ?: return
         val player = mc.player ?: return
-        if (!hasOtherPlayers(mc)) return
-
+        if (shareCooldown > 0) shareCooldown--
+        val canShare = Cfg.shareToParty && hasOtherPlayers(mc)
         val rangeSq = Cfg.range.toDouble() * Cfg.range.toDouble()
+
         for (entity in world.entities) {
             if (entity !is ArmorStandEntity || entity.isRemoved || entity.isInvisible) continue
-            val id = entity.id
-            if (id in sharedCorpses || id in openedCorpses) continue
             if (entity.squaredDistanceTo(player) > rangeSq) continue
+            val key = entity.blockPos.asLong()
+            if (key in openedKeys) continue
             val type = corpseTypeOf(entity) ?: continue
-            if (!isTypeEnabled(type)) continue
 
-            val pos = entity.blockPos
-            val msg = "x: ${pos.x}, y: ${pos.y}, z: ${pos.z} | (${labelOf(type)} Corpse)"
-            mc.player?.networkHandler?.sendChatCommand("pc $msg")
-            sharedCorpses.add(id)
-            shareCooldown = SHARE_COOLDOWN_TICKS
-            return // one per cooldown
+            corpses.putIfAbsent(key, CorpseWaypoint(type, corpseBoxOf(entity)))
+
+            if (canShare && isTypeEnabled(type) && shareCooldown <= 0 && sharedKeys.add(key)) {
+                val pos = entity.blockPos
+                mc.player?.networkHandler?.sendChatCommand(
+                    "pc x: ${pos.x}, y: ${pos.y}, z: ${pos.z} | (${labelOf(type)} Corpse)"
+                )
+                shareCooldown = SHARE_COOLDOWN_TICKS
+            }
         }
     }
 
@@ -195,24 +197,26 @@ class MineshaftUtils : Module(
         }
     }
 
-    /** Find the closest visible armor stand of [type] to the player and remember it as opened. */
+    /** Find the closest cached corpse of [type] to the player, drop its waypoint, and mark it opened. */
     private fun markNearestOpened(type: CorpseType) {
         val mc = MinecraftClient.getInstance()
-        val world = mc.world ?: return
         val player = mc.player ?: return
-        var best: ArmorStandEntity? = null
+        var bestKey: Long? = null
         var bestDistSq = OPEN_RANGE_SQ
-        for (entity in world.entities) {
-            if (entity !is ArmorStandEntity || entity.isRemoved || entity.isInvisible) continue
-            if (entity.id in openedCorpses) continue
-            if (corpseTypeOf(entity) != type) continue
-            val d = entity.squaredDistanceTo(player)
+        for ((key, wp) in corpses) {
+            if (wp.type != type) continue
+            val c = wp.box.center
+            val dx = c.x - player.x; val dy = c.y - player.y; val dz = c.z - player.z
+            val d = dx * dx + dy * dy + dz * dz
             if (d < bestDistSq) {
                 bestDistSq = d
-                best = entity
+                bestKey = key
             }
         }
-        best?.let { openedCorpses.add(it.id) }
+        bestKey?.let {
+            corpses.remove(it)
+            openedKeys.add(it)
+        }
     }
 
     /** Map a (visible) armor stand to its corpse type by its helmet's stripped name, or null. */
@@ -252,28 +256,22 @@ class MineshaftUtils : Module(
         CorpseType.VANGUARD -> Cfg.vanguardColor
     }
 
-    /** The armor stand's standing hitbox at its interpolated position, widened a touch like the reference. */
-    private fun interpolatedBox(stand: ArmorStandEntity, tickDelta: Float): Box {
-        val x = MathHelper.lerp(tickDelta.toDouble(), stand.lastRenderX, stand.x)
-        val y = MathHelper.lerp(tickDelta.toDouble(), stand.lastRenderY, stand.y)
-        val z = MathHelper.lerp(tickDelta.toDouble(), stand.lastRenderZ, stand.z)
-        return stand.getDimensions(EntityPose.STANDING)
-            .getBoxAt(Vec3d(x, y, z))
+    /** The armor stand's standing hitbox at its (fixed) position, widened a touch like the reference. */
+    private fun corpseBoxOf(stand: ArmorStandEntity): Box =
+        stand.getDimensions(EntityPose.STANDING)
+            .getBoxAt(Vec3d(stand.x, stand.y, stand.z))
             .expand(0.25, 0.0, 0.25)
-    }
 
     // ====================== Fossil Finder ======================
 
     /**
      * Drives the one-shot entry scan. Does nothing once this instance has been scanned; the heavy
-     * work runs on a background thread (see [launchScan]) and its result is applied here.
+     * work is a single one-shot block sweep done once per instance (see [scanFossils]).
      */
     private fun tickFossils(mc: MinecraftClient) {
         if (!Cfg.fossilEnabled) {
             // Disabled: drop results and re-arm so turning it back on re-scans this instance.
             if (fossils.isNotEmpty()) fossils = emptyList()
-            scanResult = null
-            scanning = false
             scannedServer = null
             return
         }
@@ -288,24 +286,9 @@ class MineshaftUtils : Module(
             return
         }
 
-        // A background scan finished — apply it (if it's still for this instance) on the main thread.
-        val result = scanResult
-        if (result != null) {
-            scanResult = null
-            scanning = false
-            if (result.server == HypixelLocation.serverName) {
-                fossils = result.fossils
-                scannedServer = HypixelLocation.serverName
-                validateCooldown = VALIDATE_INTERVAL
-            }
-            return
-        }
-
-        if (scanning) return // background scan in progress
-
-        // Not started yet: let chunks load in, then snapshot + launch the async scan once.
+        // Not started yet: let chunks load in, then do the one-shot scan once.
         if (entryDelay-- > 0) return
-        launchScan(mc)
+        scanFossils(mc)
     }
 
     /**
@@ -359,72 +342,38 @@ class MineshaftUtils : Module(
     }
 
     /**
-     * Collect fossil block positions on the main thread (cheap: only sections that actually contain
-     * quartz, found via a palette `hasAny` check, are read at all), then hand the positions to a
-     * background thread that does the pure-CPU clustering. No world/chunk access happens off-thread,
-     * so there's no race — and reading just the quartz sections is fast enough to not hitch a frame.
+     * One straightforward block sweep of the cube within [Cfg.fossilRange] around the player, using
+     * plain `world.getBlockState` (the simple, reliable approach). Runs once per instance on the
+     * client thread; the range default is kept modest so the single pass doesn't hitch. Unloaded
+     * blocks read as air, so out-of-range chunks cost nothing.
      */
-    private fun launchScan(mc: MinecraftClient) {
+    private fun scanFossils(mc: MinecraftClient) {
         val world: ClientWorld = mc.world ?: return
         val player = mc.player ?: return
-        val server = HypixelLocation.serverName
-        val r = Cfg.fossilRange
-        val rChunks = (r + 15) / 16
-        val pcx = MathHelper.floor(player.x) shr 4
-        val pcz = MathHelper.floor(player.z) shr 4
 
-        val py = MathHelper.floor(player.y)
+        val r = Cfg.fossilRange
+        val ox = MathHelper.floor(player.x)
+        val oy = MathHelper.floor(player.y)
+        val oz = MathHelper.floor(player.z)
         val worldBottom = world.bottomY
         val worldTop = worldBottom + world.height - 1
-        val minY = (py - r).coerceAtLeast(worldBottom)
-        val maxY = (py + r).coerceAtMost(worldTop)
-        val bottomSection = worldBottom shr 4
-        val firstSec = (minY shr 4) - bottomSection
-        val lastSec = (maxY shr 4) - bottomSection
+        val minY = (oy - r).coerceAtLeast(worldBottom)
+        val maxY = (oy + r).coerceAtMost(worldTop)
 
         val hits = HashSet<Long>()
-        for (cx in (pcx - rChunks)..(pcx + rChunks)) {
-            for (cz in (pcz - rChunks)..(pcz + rChunks)) {
-                if (!world.isChunkLoaded(cx, cz)) continue
-                val chunk = world.chunkManager.getChunk(cx, cz, ChunkStatus.FULL, false) ?: continue
-                val sections = chunk.sectionArray
-                for (i in firstSec.coerceAtLeast(0)..lastSec.coerceAtMost(sections.size - 1)) {
-                    val section = sections[i]
-                    if (section.isEmpty) continue
-                    if (!section.blockStateContainer.hasAny { isFossilBlock(it) }) continue
-                    val baseX = cx shl 4
-                    val baseY = (bottomSection + i) shl 4
-                    val baseZ = cz shl 4
-                    for (lx in 0..15) for (ly in 0..15) for (lz in 0..15) {
-                        val y = baseY + ly
-                        if (y < minY || y > maxY) continue
-                        if (isFossilBlock(section.getBlockState(lx, ly, lz))) {
-                            hits.add(BlockPos.asLong(baseX + lx, y, baseZ + lz))
-                        }
-                    }
+        val cursor = BlockPos.Mutable()
+        for (x in (ox - r)..(ox + r)) {
+            for (z in (oz - r)..(oz + r)) {
+                for (y in minY..maxY) {
+                    cursor.set(x, y, z)
+                    if (isFossilBlock(world.getBlockState(cursor))) hits.add(cursor.asLong())
                 }
             }
         }
 
-        // Nothing with quartz nearby — finish immediately, no thread needed.
-        if (hits.isEmpty()) {
-            fossils = emptyList()
-            scannedServer = server
-            validateCooldown = VALIDATE_INTERVAL
-            return
-        }
-
-        scanning = true
-        val minCluster = Cfg.fossilMinCluster
-        Thread({
-            val result = try {
-                clusterize(hits, minCluster)
-            } catch (t: Throwable) {
-                t.printStackTrace()
-                emptyList()
-            }
-            scanResult = ScanResult(server, result)
-        }, "lasseclient-fossil-scan").apply { isDaemon = true }.start()
+        fossils = clusterize(hits, Cfg.fossilMinCluster)
+        scannedServer = HypixelLocation.serverName
+        validateCooldown = VALIDATE_INTERVAL
     }
 
     /**
@@ -513,12 +462,10 @@ class MineshaftUtils : Module(
 
     private fun render(ctx: WorldRenderContext) {
         val mc = MinecraftClient.getInstance()
-        val world = mc.world ?: return
-        val player = mc.player ?: return
+        if (mc.world == null) return
         val matrices = ctx.matrices() ?: return
         val consumers = ctx.consumers() ?: return
         val cam = ctx.worldState().cameraRenderState.pos ?: return
-        val tickDelta = mc.renderTickCounter.getTickProgress(false)
 
         resetOnInstanceChange()
 
@@ -545,7 +492,7 @@ class MineshaftUtils : Module(
         matrices.push()
         matrices.translate(-cam.x, -cam.y, -cam.z)
 
-        if (drawCorpses) renderCorpses(mc, world, player, matrices, consumers, tickDelta, tracerOrigin)
+        if (drawCorpses) renderCorpses(matrices, consumers, tracerOrigin)
         if (drawFossils) renderFossils(matrices, consumers, cachedFossils, tracerOrigin)
 
         matrices.pop()
@@ -553,30 +500,21 @@ class MineshaftUtils : Module(
     }
 
     private fun renderCorpses(
-        mc: MinecraftClient,
-        world: ClientWorld,
-        player: net.minecraft.entity.player.PlayerEntity,
         matrices: net.minecraft.client.util.math.MatrixStack,
         consumers: net.minecraft.client.render.VertexConsumerProvider,
-        tickDelta: Float,
         tracerOrigin: Vec3d?,
     ) {
-        val rangeSq = Cfg.range.toDouble() * Cfg.range.toDouble()
         val mode = Cfg.mode
         val lineWidth = Cfg.lineWidth.toFloat()
         val through = Cfg.throughWalls
         val drawTracers = Cfg.tracers
         val tracerWidth = Cfg.tracerWidth.toFloat()
 
-        for (entity in world.entities) {
-            if (entity !is ArmorStandEntity || entity.isRemoved || entity.isInvisible) continue
-            if (entity.squaredDistanceTo(player) > rangeSq) continue
-            if (Cfg.hideOpened && entity.id in openedCorpses) continue
-            val type = corpseTypeOf(entity) ?: continue
-            if (!isTypeEnabled(type)) continue
+        for (wp in corpses.values) {
+            if (!isTypeEnabled(wp.type)) continue
 
-            val box = interpolatedBox(entity, tickDelta)
-            val color = colorOf(type)
+            val box = wp.box
+            val color = colorOf(wp.type)
 
             when (mode) {
                 HighlightMode.BOX ->

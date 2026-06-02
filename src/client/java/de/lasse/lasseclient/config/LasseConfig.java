@@ -318,11 +318,11 @@ public final class LasseConfig {
 
             @ConfigEntry(id = "fossil_range", translation = "lasseclient.config.common.range")
             @ConfigOption.Slider
-            @ConfigOption.Range(min = 16, max = 256)
+            @ConfigOption.Range(min = 16, max = 96)
             @Comment("Radius (blocks) of the one-shot scan done once when you enter a mineshaft. "
-                    + "Only loaded chunks within this radius are scanned; it never re-scans until "
-                    + "the next mineshaft.")
-            public static int fossilRange = 96;
+                    + "Higher values scan more at once (a brief one-time cost on entry); it never "
+                    + "re-scans until the next mineshaft.")
+            public static int fossilRange = 48;
 
             @ConfigEntry(id = "fossil_min_cluster", translation = "lasseclient.config.mineshaft_utils.fossil_min_cluster")
             @ConfigOption.Slider
@@ -467,14 +467,8 @@ public final class LasseConfig {
         // ---- Spawn Notification ---------------------------------------------------------------
         @ConfigOption.Separator(value = "Spawn Notification")
         @ConfigEntry(id = "spawn_notification_enabled", translation = "lasseclient.config.spawn_notification.enabled")
-        @Comment("Flash a HUD notification + pings on configured chat lines or rare mob spawns.")
+        @Comment("Flash a HUD notification + pings on rare mob spawns.")
         public static Observable<Boolean> spawnNotificationEnabled = Observable.of(false);
-
-        @ConfigEntry(id = "spawn_notification_messages", translation = "lasseclient.config.spawn_notification.messages")
-        @Comment("Chat lines that trigger the \"Spawned!!!\" notification (case-insensitive).")
-        public static final List<String> spawnNotificationMessages = new ArrayList<>(List.of(
-                "Bow down before the Frog Prince... or pay the hefty price!"
-        ));
 
         @ConfigEntry(id = "spawn_notification_mob_names", translation = "lasseclient.config.spawn_notification.mob_names")
         @Comment("Mob nametags that trigger \"RARE MOB SPAWNED IN\" + highlight.")

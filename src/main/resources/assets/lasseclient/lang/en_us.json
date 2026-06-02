@@ -59,7 +59,6 @@
   "lasseclient.config.no_visual_effects.darkness": "Darkness",
 
   "lasseclient.config.spawn_notification.enabled": "Enabled",
-  "lasseclient.config.spawn_notification.messages": "Spawn messages",
   "lasseclient.config.spawn_notification.mob_names": "Rare mob names",
   "lasseclient.config.spawn_notification.duration": "Duration",
 
