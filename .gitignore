@@ -1,0 +1,36 @@
+# Gradle
+/.gradle/
+/build/
+/bin/
+gradle-app.setting
+!gradle-wrapper.jar
+.gradletasknamecache
+
+# Fabric / Minecraft runtime
+/run/
+/runs/
+/logs/
+
+# IDE - IntelliJ IDEA
+/.idea/
+*.iml
+*.ipr
+*.iws
+/out/
+
+# IDE - Eclipse
+.classpath
+.project
+.settings/
+/bin/
+
+# IDE - VS Code
+/.vscode/
+
+# Claude / local tooling
+/.claude/
+/examples/
+
+# OS
+.DS_Store
+Thumbs.db

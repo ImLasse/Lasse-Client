@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "lasseclient",
+  "version": "${version}",
+  "name": "lasseclient",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "icon": "assets/lasseclient/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-datagen": [
+      "de.lasse.lasseclient.client.LasseclientDataGenerator"
+    ],
+    "client": [
+      "de.lasse.lasseclient.client.LasseclientClient"
+    ],
+    "main": [
+      "de.lasse.lasseclient.Lasseclient"
+    ]
+  },
+  "mixins": [
+    "lasseclient.mixins.json",
+    {
+      "config": "lasseclient.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-language-kotlin": ">=${kotlin_loader_version}",
+    "fabric-api": ">=${fabric_version}",
+    "resourcefulconfig": ">=${resourcefulconfig_version}",
+    "hypixel-mod-api": ">=1.0",
+    "minecraft": "${minecraft_version}"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}
