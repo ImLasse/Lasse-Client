@@ -95,12 +95,6 @@ class MineshaftUtils : Module(
     /** Background scan output, tagged with the instance it was for so a stale result is ignored. */
     private class ScanResult(val server: String?, val fossils: List<Fossil>)
 
-    /** A copied (thread-safe) palette of one chunk section plus its world-space origin. */
-    private class SectionSnapshot(
-        val baseX: Int, val baseY: Int, val baseZ: Int,
-        val container: net.minecraft.world.chunk.PalettedContainer<BlockState>,
-    )
-
     init {
         WorldRenderEvents.END_MAIN.register(WorldRenderEvents.EndMain { ctx ->
             if (isActive()) render(ctx)
@@ -365,10 +359,10 @@ class MineshaftUtils : Module(
     }
 
     /**
-     * Snapshot every loaded chunk within [Cfg.fossilRange] on the main thread — but only the
-     * sections that actually contain quartz (a cheap palette `hasAny` check), and only their
-     * copied (thread-safe) palette. Then hand the snapshots to a background thread that does the
-     * heavy 16³ block iteration + clustering, so there's no frame hitch and results appear quickly.
+     * Collect fossil block positions on the main thread (cheap: only sections that actually contain
+     * quartz, found via a palette `hasAny` check, are read at all), then hand the positions to a
+     * background thread that does the pure-CPU clustering. No world/chunk access happens off-thread,
+     * so there's no race — and reading just the quartz sections is fast enough to not hitch a frame.
      */
     private fun launchScan(mc: MinecraftClient) {
         val world: ClientWorld = mc.world ?: return
@@ -385,33 +379,35 @@ class MineshaftUtils : Module(
         val minY = (py - r).coerceAtLeast(worldBottom)
         val maxY = (py + r).coerceAtMost(worldTop)
         val bottomSection = worldBottom shr 4
+        val firstSec = (minY shr 4) - bottomSection
+        val lastSec = (maxY shr 4) - bottomSection
 
-        val snapshots = ArrayList<SectionSnapshot>()
+        val hits = HashSet<Long>()
         for (cx in (pcx - rChunks)..(pcx + rChunks)) {
             for (cz in (pcz - rChunks)..(pcz + rChunks)) {
                 if (!world.isChunkLoaded(cx, cz)) continue
                 val chunk = world.chunkManager.getChunk(cx, cz, ChunkStatus.FULL, false) ?: continue
                 val sections = chunk.sectionArray
-                val firstSec = (minY shr 4) - bottomSection
-                val lastSec = (maxY shr 4) - bottomSection
                 for (i in firstSec.coerceAtLeast(0)..lastSec.coerceAtMost(sections.size - 1)) {
                     val section = sections[i]
                     if (section.isEmpty) continue
                     if (!section.blockStateContainer.hasAny { isFossilBlock(it) }) continue
-                    snapshots.add(
-                        SectionSnapshot(
-                            baseX = cx shl 4,
-                            baseY = (bottomSection + i) shl 4,
-                            baseZ = cz shl 4,
-                            container = section.blockStateContainer.copy(),
-                        )
-                    )
+                    val baseX = cx shl 4
+                    val baseY = (bottomSection + i) shl 4
+                    val baseZ = cz shl 4
+                    for (lx in 0..15) for (ly in 0..15) for (lz in 0..15) {
+                        val y = baseY + ly
+                        if (y < minY || y > maxY) continue
+                        if (isFossilBlock(section.getBlockState(lx, ly, lz))) {
+                            hits.add(BlockPos.asLong(baseX + lx, y, baseZ + lz))
+                        }
+                    }
                 }
             }
         }
 
         // Nothing with quartz nearby — finish immediately, no thread needed.
-        if (snapshots.isEmpty()) {
+        if (hits.isEmpty()) {
             fossils = emptyList()
             scannedServer = server
             validateCooldown = VALIDATE_INTERVAL
@@ -421,17 +417,13 @@ class MineshaftUtils : Module(
         scanning = true
         val minCluster = Cfg.fossilMinCluster
         Thread({
-            val hits = HashSet<Long>()
-            for (snap in snapshots) {
-                for (lx in 0..15) for (ly in 0..15) for (lz in 0..15) {
-                    val y = snap.baseY + ly
-                    if (y < minY || y > maxY) continue
-                    if (isFossilBlock(snap.container.get(lx, ly, lz))) {
-                        hits.add(BlockPos.asLong(snap.baseX + lx, y, snap.baseZ + lz))
-                    }
-                }
+            val result = try {
+                clusterize(hits, minCluster)
+            } catch (t: Throwable) {
+                t.printStackTrace()
+                emptyList()
             }
-            scanResult = ScanResult(server, clusterize(hits, minCluster))
+            scanResult = ScanResult(server, result)
         }, "lasseclient-fossil-scan").apply { isDaemon = true }.start()
     }
 
