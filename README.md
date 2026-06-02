@@ -1,84 +1,63 @@
 # Lasse Client
 
-A Fabric **client-side** utility mod for Hypixel SkyBlock, built for Minecraft `1.21.11`.
-Everything is toggleable from an in-game config screen, every overlay is drag-to-place, and
-location-sensitive features are gated through the official Hypixel Mod API so they only run where
-they belong.
+A Fabric mod for Hypixel SkyBlock on Minecraft 1.21.11. It adds a handful of quality-of-life
+features you can turn on and off from an in-game menu. Each on-screen display can be dragged
+wherever you want it, and features that only matter in certain places (like the Garden) only show
+up when you're actually there.
 
-> **Client-side & cosmetic by design.** Modules act on the local render/world snapshot. Nothing
-> here reads, forges, or sends gameplay packets.
+Everything runs on your own game. It changes what you see and lets you set up your own shortcuts —
+it doesn't touch how you connect to the server.
 
----
+## Features
 
-## ✨ Features
+### Visual
 
-### 👁 Visual
+- **Mob Highlighter** — Draws an outline (and an optional line pointing to it) around mobs whose
+  name matches a list you set up. Handy for spotting specific mobs in a crowd. You pick the color,
+  outline thickness, how far away it works, and whether you can see it through walls.
+- **Pest ESP** — Highlights Garden pests so you can find them fast. Only active on the Garden.
+- **Mineshaft Utils** — Helpers for Glacite Mineshafts. Highlights corpses through walls (and can
+  hide ones you've already opened or share their location with your party), and finds fossils by
+  marking the spots worth digging.
+- **Lilypad Helper** — Warns you right before a Garden lily-pad bomb goes off with an on-screen
+  alert, a sound, and a red marker on the bomb. Can also highlight every lily pad if you want.
+- **No Visual Effects** — Hides the blindness, nausea, and darkness screen effects so your view
+  stays clear. The effect itself isn't removed — you just don't have to look at it.
 
-| Module | What it does |
-| --- | --- |
-| **Mob Highlighter** | Box / tracer ESP for SkyBlock mobs matched against your own nametag list. Color, line width, fill opacity, range, tracers and through-walls all configurable. |
-| **Pest ESP** | Highlights Garden pests by nametag. Auto-gated to the SkyBlock Garden via the Hypixel Mod API location event. |
-| **Mineshaft Utils** | Glacite Mineshaft helpers — corpse finder (through-wall ESP, hide-opened, share-to-party) plus a fossil finder that scans for quartz clusters and waypoints them. |
-| **Lilypad Helper** | Warns before a Garden lily-pad bomb detonates with a HUD flash, ping and red box, and can optionally highlight every lily pad. |
-| **No Visual Effects** | Suppresses blindness, nausea and darkness purely at the render layer — the effect is kept and no packet is touched. |
+### Notifications
 
-### 🔔 Notifications
+- **Chat Notifications** — Watches your chat and flashes a message on screen with a sound when
+  something you care about shows up. You decide what to watch for, what it says, what color it is,
+  and which sound plays.
+- **Spawn Notification** — Pops up an alert and plays a sound when a rare mob spawns or a chat line
+  you've set up appears, and highlights the spawn so you can see where it is.
 
-| Module | What it does |
-| --- | --- |
-| **Chat Notifications** | Flashes a HUD message and plays a sound when incoming chat matches your rules (per-rule message, color and sound). |
-| **Spawn Notification** | HUD notification + ping on configured chat lines or rare mob spawns, with the spawn highlighted via ESP. |
+### Utilities
 
-### ⚙ Utilities
+- **Chat Commands** — Automatically runs a command for you when a chat message matches one of your
+  rules — for example, warping somewhere the moment a certain message appears. Each rule has a
+  short cooldown so it won't spam.
 
-| Module | What it does |
-| --- | --- |
-| **Chat Commands** | Runs a command automatically when chat matches one of your rules, with per-rule cooldown and optional announce. |
-| **Display Entity Debug** | Inspects lily-pad / display entities and reports their live interpolated scale — a tuning helper. |
-
----
-
-## ⌨ Controls & Configuration
+## Controls
 
 | Action | Default key |
 | --- | --- |
-| Open config screen | `Right Shift` |
-| Edit HUD layout | `Right Control` |
+| Open the settings menu | Right Shift |
+| Move your on-screen displays | Right Control |
 
-Both keys are rebindable in **Options → Controls**. Configuration is powered by
-[Resourceful Config](https://modrinth.com/mod/resourceful-config), so the same settings screen is
-also reachable through **Mod Menu**. Per-rule lists (highlight names, chat rules, command rules)
-each get their own dropdowns and color pickers.
+You can change both keys in **Options → Controls**. If you have Mod Menu installed, you can also
+open the settings from there.
 
----
+## Installation
 
-## 📦 Installation
-
-1. Install [Fabric Loader](https://fabricmc.net/use/) for Minecraft `1.21.11`.
-2. Drop these into your `mods/` folder:
-   - **Lasse Client** (`lasseclient-*.jar` from [Releases](../../releases))
+1. Install [Fabric](https://fabricmc.net/use/) for Minecraft 1.21.11.
+2. Put these in your `mods` folder:
+   - **Lasse Client** — grab the latest jar from the [Releases](../../releases) page.
    - [Fabric API](https://modrinth.com/mod/fabric-api)
    - [Fabric Language Kotlin](https://modrinth.com/mod/fabric-language-kotlin)
-   - [Mod Menu](https://modrinth.com/mod/modmenu) *(optional, recommended)*
-3. Resourceful Config and the Hypixel Mod API are **bundled** inside the jar — no separate download
-   needed.
+   - [Mod Menu](https://modrinth.com/mod/modmenu) (optional, but handy)
+3. Launch the game and press Right Shift to open the settings.
 
----
-
-## 🛠 Building from source
-
-The project targets **Java 21** and builds with **Gradle 9.4.0**.
-
-```bash
-gradle build
-```
-
-The release jar lands in `build/libs/lasseclient-<version>.jar`. Pushing to `main` builds and
-publishes this jar automatically via GitHub Actions (see
-[`.github/workflows/release.yml`](.github/workflows/release.yml)).
-
----
-
-## 📄 License
+## License
 
 See [LICENSE.txt](LICENSE.txt).
