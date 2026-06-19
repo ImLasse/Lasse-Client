@@ -12,6 +12,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents
+import net.fabricmc.fabric.api.event.player.UseEntityCallback
 import net.minecraft.block.BlockState
 import net.minecraft.block.Blocks
 import net.minecraft.client.MinecraftClient
@@ -19,6 +20,7 @@ import net.minecraft.client.world.ClientWorld
 import net.minecraft.entity.EntityPose
 import net.minecraft.entity.EquipmentSlot
 import net.minecraft.entity.decoration.ArmorStandEntity
+import net.minecraft.util.ActionResult
 import net.minecraft.util.math.BlockPos
 import net.minecraft.util.math.Box
 import net.minecraft.util.math.MathHelper
@@ -71,29 +73,32 @@ class MineshaftUtils : Module(
 
     // ---- Fossil state ---------------------------------------------------------
     //
-    // Fossils are scanned exactly once per mineshaft instance: a short delay after entering (so
-    // chunks load) we do one straightforward block sweep of the cube around us, cluster the hits,
-    // and stop. We don't scan again until you enter another mineshaft (server name changes). As you
-    // mine, the affected waypoints shrink/disappear without any re-scan.
+    // Fossils are found by a *periodic* block sweep of the cube around the player rather than a
+    // single one-shot scan: on entry the surrounding chunks usually aren't loaded yet, so one early
+    // scan finds nothing and (in the old design) gave up forever. Instead we re-sweep on an interval,
+    // accumulating every quartz block we've seen this instance into [discoveredQuartz] (so fossils
+    // persist as you explore and don't vanish when you walk away) and pruning blocks that are loaded
+    // but no longer quartz (mined). The discovered set is re-clustered into waypoints whenever it
+    // changes. Columns whose chunk isn't loaded are skipped, so the sweep is cheap off in the dark.
 
-    /**
-     * A detected fossil: the quartz block positions that make it up plus their bounding box. We
-     * keep the blocks (not just the box) so we can shrink/drop the waypoint as they're mined,
-     * without re-running the scan.
-     */
-    private class Fossil(val blocks: MutableSet<Long>, @Volatile var box: Box)
+    /** A detected fossil: the quartz block positions that make it up plus their bounding box. */
+    private class Fossil(val blocks: Set<Long>, val box: Box)
 
-    /** Detected fossils. Set once when the entry scan finishes, then pruned as blocks are mined. */
+    /** Detected fossils, re-clustered from [discoveredQuartz] whenever that set changes. */
     @Volatile private var fossils: List<Fossil> = emptyList()
 
-    /** Server name we've already completed a scan for; `== current` means "don't scan again". */
-    private var scannedServer: String? = null
+    /**
+     * Every fossil (quartz) block position discovered in the current mineshaft instance. Touched
+     * only on the client tick thread. Persists across sweeps (so fossils stay once found) and is
+     * pruned when a block is loaded but no longer quartz (mined). Reset on instance change.
+     */
+    private val discoveredQuartz: MutableSet<Long> = HashSet()
 
-    /** Ticks to wait after entering before scanning, so nearby chunks have arrived. */
-    private var entryDelay = 0
+    /** Mineshaft instance the [discoveredQuartz] set belongs to; a change clears and re-scans it. */
+    private var fossilServer: String? = null
 
-    /** Ticks until the next mined-block re-validation of existing fossils. */
-    private var validateCooldown = 0
+    /** Ticks until the next periodic fossil sweep. */
+    private var scanCooldown = 0
 
     init {
         WorldRenderEvents.END_MAIN.register(WorldRenderEvents.EndMain { ctx ->
@@ -103,6 +108,7 @@ class MineshaftUtils : Module(
         ClientTickEvents.END_CLIENT_TICK.register(ClientTickEvents.EndTick { mc ->
             if (!isActive()) {
                 if (fossils.isNotEmpty()) fossils = emptyList()
+                if (discoveredQuartz.isNotEmpty()) discoveredQuartz.clear()
                 return@EndTick
             }
             resetOnInstanceChange()
@@ -118,13 +124,30 @@ class MineshaftUtils : Module(
             val type = lootMessageType(stripFormatting(message.string)) ?: return@Game
             markNearestOpened(type)
         })
+
+        // You open a corpse by right-clicking its armor stand. That's the most reliable "opened"
+        // signal — the loot chat line above is kept only as a fallback — so forget that exact corpse
+        // (by its block position) the instant it's interacted with, regardless of where you stand.
+        UseEntityCallback.EVENT.register(UseEntityCallback { player, _, _, entity, _ ->
+            if (isActive() && Cfg.corpseEnabled && Cfg.hideOpened &&
+                player === MinecraftClient.getInstance().player &&
+                entity is ArmorStandEntity && corpseTypeOf(entity) != null
+            ) {
+                val key = entity.blockPos.asLong()
+                openedKeys.add(key) // keep a later scan from re-adding it even if not cached yet
+                corpses.remove(key)
+            }
+            ActionResult.PASS
+        })
     }
 
     private fun isActive(): Boolean = enabled && HypixelLocation.onMineshaft
 
     /**
      * Corpse keys/positions are per-instance; warping to another mineshaft must not carry over old
-     * waypoints. Drop all per-instance corpse state (and re-arm the fossil scan) on a server change.
+     * waypoints. Drop all per-instance corpse state on a server change. (Fossil state is reset on
+     * the tick thread in [tickFossils], since [discoveredQuartz] isn't thread-safe and this runs
+     * from the render thread too.)
      */
     private fun resetOnInstanceChange() {
         val server = HypixelLocation.serverName
@@ -133,10 +156,6 @@ class MineshaftUtils : Module(
             corpses.clear()
             openedKeys.clear()
             sharedKeys.clear()
-            // New mineshaft instance: forget old fossils and arm a fresh one-shot scan.
-            fossils = emptyList()
-            scannedServer = null
-            entryDelay = ENTRY_SCAN_DELAY_TICKS
         }
     }
 
@@ -265,72 +284,32 @@ class MineshaftUtils : Module(
     // ====================== Fossil Finder ======================
 
     /**
-     * Drives the one-shot entry scan. Does nothing once this instance has been scanned; the heavy
-     * work is a single one-shot block sweep done once per instance (see [scanFossils]).
+     * Resets fossil state on instance change, then drives the periodic sweep: after a short initial
+     * delay (so the first nearby chunks arrive) it re-sweeps every [SCAN_INTERVAL] ticks, which both
+     * keeps discovering fossils as chunks load / you explore and prunes ones you've mined. Runs on
+     * the client tick thread, so it owns [discoveredQuartz].
      */
     private fun tickFossils(mc: MinecraftClient) {
+        val server = HypixelLocation.serverName
+        if (server != fossilServer) {
+            // New mineshaft instance: forget old fossils and wait for chunks before the first sweep.
+            fossilServer = server
+            discoveredQuartz.clear()
+            fossils = emptyList()
+            scanCooldown = ENTRY_SCAN_DELAY_TICKS
+        }
+
         if (!Cfg.fossilEnabled) {
             // Disabled: drop results and re-arm so turning it back on re-scans this instance.
             if (fossils.isNotEmpty()) fossils = emptyList()
-            scannedServer = null
+            if (discoveredQuartz.isNotEmpty()) discoveredQuartz.clear()
+            scanCooldown = 0
             return
         }
 
-        // Already finished a scan for the current instance — just keep waypoints in sync with
-        // mining (drop blocks that became air, shrink/remove the affected fossils).
-        if (scannedServer == HypixelLocation.serverName) {
-            if (validateCooldown-- <= 0) {
-                validateCooldown = VALIDATE_INTERVAL
-                validateMinedFossils(mc)
-            }
-            return
-        }
-
-        // Not started yet: let chunks load in, then do the one-shot scan once.
-        if (entryDelay-- > 0) return
+        if (scanCooldown-- > 0) return
+        scanCooldown = SCAN_INTERVAL
         scanFossils(mc)
-    }
-
-    /**
-     * Re-check the blocks of every known fossil against the (loaded) world and prune mined ones.
-     * Cheap — total fossil blocks is small. A block whose chunk isn't loaded is left untouched so
-     * fossils that merely went out of render distance aren't falsely cleared; only blocks that are
-     * loaded *and* no longer quartz are removed. A fossil with no blocks left loses its waypoint.
-     */
-    private fun validateMinedFossils(mc: MinecraftClient) {
-        val current = fossils
-        if (current.isEmpty()) return
-        val world: ClientWorld = mc.world ?: return
-
-        var changed = false
-        val survivors = ArrayList<Fossil>(current.size)
-        val cursor = BlockPos.Mutable()
-        for (fossil in current) {
-            var mined = false
-            val it = fossil.blocks.iterator()
-            while (it.hasNext()) {
-                val packed = it.next()
-                val x = BlockPos.unpackLongX(packed)
-                val y = BlockPos.unpackLongY(packed)
-                val z = BlockPos.unpackLongZ(packed)
-                if (!world.isChunkLoaded(x shr 4, z shr 4)) continue
-                cursor.set(x, y, z)
-                if (!isFossilBlock(world.getBlockState(cursor))) {
-                    it.remove()
-                    mined = true
-                }
-            }
-            if (fossil.blocks.isEmpty()) {
-                changed = true // fully mined: drop the waypoint
-            } else {
-                if (mined) {
-                    fossil.box = boundingBoxOf(fossil.blocks)
-                    changed = true
-                }
-                survivors.add(fossil)
-            }
-        }
-        if (changed) fossils = survivors
     }
 
     /** Blocks that make up a fossil. Fossils are quartz structures (F3 shows `minecraft:quartz_block`). */
@@ -342,10 +321,12 @@ class MineshaftUtils : Module(
     }
 
     /**
-     * One straightforward block sweep of the cube within [Cfg.fossilRange] around the player, using
-     * plain `world.getBlockState` (the simple, reliable approach). Runs once per instance on the
-     * client thread; the range default is kept modest so the single pass doesn't hitch. Unloaded
-     * blocks read as air, so out-of-range chunks cost nothing.
+     * One block sweep of the cube within [Cfg.fossilRange] around the player. Every loaded quartz
+     * block is accumulated into [discoveredQuartz] (so fossils persist once seen), and any loaded
+     * block in range that's no longer quartz is dropped from it (so mined fossils shrink/disappear).
+     * Columns whose chunk isn't loaded are skipped entirely, so the sweep is cheap when surrounded
+     * by unloaded space and out-of-range chunks cost nothing. Re-clusters only when something
+     * actually changed.
      */
     private fun scanFossils(mc: MinecraftClient) {
         val world: ClientWorld = mc.world ?: return
@@ -360,20 +341,24 @@ class MineshaftUtils : Module(
         val minY = (oy - r).coerceAtLeast(worldBottom)
         val maxY = (oy + r).coerceAtMost(worldTop)
 
-        val hits = HashSet<Long>()
+        var changed = false
         val cursor = BlockPos.Mutable()
         for (x in (ox - r)..(ox + r)) {
             for (z in (oz - r)..(oz + r)) {
+                if (!world.isChunkLoaded(x shr 4, z shr 4)) continue
                 for (y in minY..maxY) {
                     cursor.set(x, y, z)
-                    if (isFossilBlock(world.getBlockState(cursor))) hits.add(cursor.asLong())
+                    val key = cursor.asLong()
+                    if (isFossilBlock(world.getBlockState(cursor))) {
+                        if (discoveredQuartz.add(key)) changed = true
+                    } else if (discoveredQuartz.remove(key)) {
+                        changed = true // was quartz before, now mined/changed
+                    }
                 }
             }
         }
 
-        fossils = clusterize(hits, Cfg.fossilMinCluster)
-        scannedServer = HypixelLocation.serverName
-        validateCooldown = VALIDATE_INTERVAL
+        if (changed) fossils = clusterize(discoveredQuartz, Cfg.fossilMinCluster)
     }
 
     /**
@@ -586,10 +571,10 @@ class MineshaftUtils : Module(
         /** ~0.75s at 20 TPS between party-chat shares, so a burst of corpses can't trip the spam filter. */
         const val SHARE_COOLDOWN_TICKS = 15
 
-        /** ~0.5s at 20 TPS after entering before snapshotting, so nearby chunks have arrived. */
+        /** ~0.5s at 20 TPS after entering before the first sweep, so the nearest chunks have arrived. */
         const val ENTRY_SCAN_DELAY_TICKS = 10
 
-        /** ~0.5s at 20 TPS between mined-fossil re-checks; cheap since total fossil blocks is small. */
-        const val VALIDATE_INTERVAL = 10
+        /** ~2s at 20 TPS between fossil sweeps: keeps discovering as chunks load without hitching. */
+        const val SCAN_INTERVAL = 40
     }
 }
